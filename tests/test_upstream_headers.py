@@ -8,7 +8,7 @@ from typer import BadParameter
 from typer.testing import CliRunner
 from unittest.mock import patch
 
-from ollama_mcp_bridge.utils import parse_upstream_headers
+from ollama_mcp_bridge.utils import parse_upstream_headers, parse_bool_env
 
 _ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*m")
 
@@ -151,3 +151,231 @@ def test_cli_invalid_env_json(monkeypatch):
     assert result.exit_code == 2
     output = _ANSI_ESCAPE_RE.sub("", result.output)
     assert "UPSTREAM_HEADERS" in output
+
+
+# --- parse_bool_env unit tests ----------------------------------------------
+
+
+def test_parse_bool_env_unset_returns_default(monkeypatch):
+    monkeypatch.delenv("TEST_BOOL_VAR", raising=False)
+    assert parse_bool_env("TEST_BOOL_VAR", True) is True
+    assert parse_bool_env("TEST_BOOL_VAR", False) is False
+
+
+def test_parse_bool_env_truthy_values(monkeypatch):
+    for value in ["1", "true", "TRUE", "yes", "Y", "on", "t"]:
+        monkeypatch.setenv("TEST_BOOL_VAR", value)
+        assert parse_bool_env("TEST_BOOL_VAR", False) is True, value
+
+
+def test_parse_bool_env_falsy_values(monkeypatch):
+    for value in ["0", "false", "FALSE", "no", "N", "off", "f"]:
+        monkeypatch.setenv("TEST_BOOL_VAR", value)
+        assert parse_bool_env("TEST_BOOL_VAR", True) is False, value
+
+
+def test_parse_bool_env_empty_returns_default(monkeypatch):
+    monkeypatch.setenv("TEST_BOOL_VAR", "   ")
+    assert parse_bool_env("TEST_BOOL_VAR", True) is True
+
+
+def test_parse_bool_env_unknown_returns_default(monkeypatch):
+    monkeypatch.setenv("TEST_BOOL_VAR", "maybe")
+    assert parse_bool_env("TEST_BOOL_VAR", False) is False
+
+
+# --- Forwarding flag wiring (CLI + state) -----------------------------------
+
+
+def test_cli_forward_client_headers_default_true(monkeypatch):
+    monkeypatch.delenv("FORWARD_CLIENT_HEADERS", raising=False)
+    from ollama_mcp_bridge.api import app as fastapi_app
+
+    result, _ = _invoke(["--config", "mcp-config.json"])
+
+    assert result.exit_code == 0, result.output
+    assert fastapi_app.state.forward_client_headers is True
+
+
+def test_cli_no_forward_client_headers_flag(monkeypatch):
+    monkeypatch.delenv("FORWARD_CLIENT_HEADERS", raising=False)
+    from ollama_mcp_bridge.api import app as fastapi_app
+
+    result, _ = _invoke(["--config", "mcp-config.json", "--no-forward-client-headers"])
+
+    assert result.exit_code == 0, result.output
+    assert fastapi_app.state.forward_client_headers is False
+
+
+def test_cli_forward_client_headers_env_false(monkeypatch):
+    monkeypatch.setenv("FORWARD_CLIENT_HEADERS", "false")
+    from ollama_mcp_bridge.api import app as fastapi_app
+
+    result, _ = _invoke(["--config", "mcp-config.json"])
+
+    assert result.exit_code == 0, result.output
+    assert fastapi_app.state.forward_client_headers is False
+
+
+def test_cli_forward_client_headers_flag_overrides_env(monkeypatch):
+    monkeypatch.setenv("FORWARD_CLIENT_HEADERS", "false")
+    from ollama_mcp_bridge.api import app as fastapi_app
+
+    result, _ = _invoke(["--config", "mcp-config.json", "--forward-client-headers"])
+
+    assert result.exit_code == 0, result.output
+    assert fastapi_app.state.forward_client_headers is True
+
+
+# --- Forwarding behavior (ProxyService unit tests) --------------------------
+
+
+class _DummyResponse:
+    def raise_for_status(self):
+        return None
+
+    def json(self):
+        return {"message": {"content": "ok"}}
+
+
+class _DummyAsyncClient:
+    def __init__(self):
+        self.calls = []
+
+    async def post(self, url, json=None, headers=None):
+        self.calls.append({"url": url, "json": json, "headers": headers})
+        return _DummyResponse()
+
+    async def aclose(self):
+        return None
+
+
+class _DummyRequest:
+    def __init__(self, headers):
+        self.headers = headers
+
+
+def _make_proxy_service(forward_client_headers, ollama_headers=None):
+    from ollama_mcp_bridge.mcp_manager import MCPManager
+    from ollama_mcp_bridge.proxy_service import ProxyService
+
+    mgr = MCPManager(
+        ollama_url="http://localhost:11434",
+        ollama_headers=ollama_headers,
+        forward_client_headers=forward_client_headers,
+    )
+    ps = ProxyService(mgr)
+    return ps, mgr
+
+
+@pytest.mark.anyio
+async def test_forwarding_disabled_does_not_forward_client_headers():
+    ps, mgr = _make_proxy_service(forward_client_headers=False)
+    original = ps.http_client
+    ps.http_client = _DummyAsyncClient()
+    try:
+        request = _DummyRequest({"authorization": "Bearer client", "X-Custom": "v"})
+        await ps._proxy_with_tools_non_streaming(
+            "/api/chat",
+            {"model": "m", "messages": [{"role": "user", "content": "hi"}]},
+            request=request,
+        )
+        assert ps.http_client.calls[0]["headers"] == {}
+    finally:
+        dummy = ps.http_client
+        ps.http_client = original
+        await dummy.aclose()
+        await original.aclose()
+        await mgr.http_client.aclose()
+
+
+@pytest.mark.anyio
+async def test_forwarding_enabled_forwards_authorization():
+    ps, mgr = _make_proxy_service(forward_client_headers=True)
+    original = ps.http_client
+    ps.http_client = _DummyAsyncClient()
+    try:
+        request = _DummyRequest({"authorization": "Bearer client-token", "X-Custom": "v"})
+        await ps._proxy_with_tools_non_streaming(
+            "/api/chat",
+            {"model": "m", "messages": [{"role": "user", "content": "hi"}]},
+            request=request,
+        )
+        sent = ps.http_client.calls[0]["headers"]
+        assert sent.get("authorization") == "Bearer client-token"
+        assert sent.get("X-Custom") == "v"
+        assert "host" not in {k.lower() for k in sent}
+    finally:
+        dummy = ps.http_client
+        ps.http_client = original
+        await dummy.aclose()
+        await original.aclose()
+        await mgr.http_client.aclose()
+
+
+@pytest.mark.anyio
+async def test_forwarding_excludes_host_header():
+    ps, mgr = _make_proxy_service(forward_client_headers=True)
+    original = ps.http_client
+    ps.http_client = _DummyAsyncClient()
+    try:
+        request = _DummyRequest({"host": "evil.example", "authorization": "Bearer x"})
+        await ps._proxy_with_tools_non_streaming(
+            "/api/chat",
+            {"model": "m", "messages": [{"role": "user", "content": "hi"}]},
+            request=request,
+        )
+        sent = ps.http_client.calls[0]["headers"]
+        assert "host" not in sent
+        assert "Host" not in sent
+        assert sent.get("authorization") == "Bearer x"
+    finally:
+        dummy = ps.http_client
+        ps.http_client = original
+        await dummy.aclose()
+        await original.aclose()
+        await mgr.http_client.aclose()
+
+
+@pytest.mark.anyio
+async def test_configured_static_header_overrides_forwarded_client_header():
+    ps, mgr = _make_proxy_service(forward_client_headers=True, ollama_headers={"Authorization": "Bearer static"})
+    original = ps.http_client
+    ps.http_client = _DummyAsyncClient()
+    try:
+        request = _DummyRequest({"authorization": "Bearer client"})
+        await ps._proxy_with_tools_non_streaming(
+            "/api/chat",
+            {"model": "m", "messages": [{"role": "user", "content": "hi"}]},
+            request=request,
+        )
+        sent = ps.http_client.calls[0]["headers"]
+        assert sent.get("Authorization") == "Bearer static"
+        assert "authorization" not in sent  # lower-cased client key is filtered
+    finally:
+        dummy = ps.http_client
+        ps.http_client = original
+        await dummy.aclose()
+        await original.aclose()
+        await mgr.http_client.aclose()
+
+
+@pytest.mark.anyio
+async def test_forwarding_disabled_only_sends_static_headers():
+    ps, mgr = _make_proxy_service(forward_client_headers=False, ollama_headers={"X-API-Key": "k"})
+    original = ps.http_client
+    ps.http_client = _DummyAsyncClient()
+    try:
+        request = _DummyRequest({"authorization": "Bearer client", "X-Custom": "v"})
+        await ps._proxy_with_tools_non_streaming(
+            "/api/chat",
+            {"model": "m", "messages": [{"role": "user", "content": "hi"}]},
+            request=request,
+        )
+        assert ps.http_client.calls[0]["headers"] == {"X-API-Key": "k"}
+    finally:
+        dummy = ps.http_client
+        ps.http_client = original
+        await dummy.aclose()
+        await original.aclose()
+        await mgr.http_client.aclose()

@@ -22,11 +22,16 @@ class MCPManager:
         ollama_url: str = "http://localhost:11434",
         system_prompt: str = None,
         ollama_headers: Optional[Dict[str, str]] = None,
+        forward_client_headers: bool = False,
     ):
         """Initialize MCP Manager
 
         Args:
             ollama_url: URL of the Ollama server
+            forward_client_headers: When True, the proxy service forwards per-request
+                HTTP headers (except ``host``) from inbound client requests to
+                upstream Ollama calls. Static ``ollama_headers`` still take precedence
+                on a case-insensitive name match.
         """
         self.sessions: Dict[str, ClientSession] = {}
         self.all_tools: List[dict] = []
@@ -35,6 +40,8 @@ class MCPManager:
         self.ollama_headers = ollama_headers or {}
         # Optional system prompt that can be prepended to messages
         self.system_prompt = system_prompt
+        # Whether per-request client headers should be forwarded to Ollama
+        self.forward_client_headers = bool(forward_client_headers)
         is_set, timeout_seconds = get_ollama_proxy_timeout_config()
         self.http_client = httpx.AsyncClient(timeout=timeout_seconds) if is_set else httpx.AsyncClient()
 

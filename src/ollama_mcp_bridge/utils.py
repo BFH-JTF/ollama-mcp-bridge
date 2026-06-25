@@ -169,6 +169,30 @@ async def iter_ndjson_chunks(chunk_iterator):
             logger.debug(f"Error parsing trailing NDJSON: {e}")
 
 
+def parse_bool_env(env_name: str, default: bool) -> bool:
+    """Parse a boolean value from an environment variable.
+
+    Recognized truthy values (case-insensitive): "1", "true", "yes", "on", "y", "t".
+    Recognized falsy values: "0", "false", "no", "off", "n", "f".
+    Empty or unset values fall back to ``default``. Unrecognized non-empty values
+    also fall back to ``default`` (logged at debug level so it is visible without
+    spamming typical startup output).
+    """
+    raw = os.getenv(env_name)
+    if raw is None:
+        return default
+    raw = raw.strip()
+    if not raw:
+        return default
+    normalized = raw.lower()
+    if normalized in {"1", "true", "yes", "on", "y", "t"}:
+        return True
+    if normalized in {"0", "false", "no", "off", "n", "f"}:
+        return False
+    logger.debug(f"{env_name}={raw!r} is not a recognized boolean; falling back to default={default}")
+    return default
+
+
 def parse_upstream_headers(env_value: Optional[str], header_flags: Optional[list] = None) -> Optional[Dict[str, str]]:
     """Build the upstream headers dict from the UPSTREAM_HEADERS env var and CLI flags.
 

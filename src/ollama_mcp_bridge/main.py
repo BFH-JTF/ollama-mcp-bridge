@@ -8,7 +8,14 @@ from loguru import logger
 from typing import List, Optional
 
 from .api import app
-from .utils import check_ollama_health, check_for_updates, validate_cli_inputs, is_port_in_use, parse_upstream_headers
+from .utils import (
+    check_ollama_health,
+    check_for_updates,
+    validate_cli_inputs,
+    is_port_in_use,
+    parse_upstream_headers,
+    parse_bool_env,
+)
 from . import __version__
 
 
@@ -24,6 +31,13 @@ def cli_app(
         "--upstream-header",
         help="Header to send to the upstream server as 'Name: Value' (repeatable). "
         "Can also be set via the UPSTREAM_HEADERS env var (JSON object).",
+    ),
+    forward_client_headers: Optional[bool] = typer.Option(
+        None,
+        "--forward-client-headers/--no-forward-client-headers",
+        help="Forward inbound client request headers (except 'host') to Ollama on /api/chat. "
+        "Static --upstream-header / UPSTREAM_HEADERS values still take precedence on a "
+        "case-insensitive name match. Can also be set via the FORWARD_CLIENT_HEADERS env var.",
     ),
     max_tool_rounds: Optional[int] = typer.Option(
         os.getenv("MAX_TOOL_ROUNDS", None),
@@ -50,6 +64,10 @@ def cli_app(
 
     upstream_headers = parse_upstream_headers(os.getenv("UPSTREAM_HEADERS"), upstream_header)
 
+    # Resolve forwarding flag: CLI flag wins over env var; default is enabled.
+    if forward_client_headers is None:
+        forward_client_headers = parse_bool_env("FORWARD_CLIENT_HEADERS", True)
+
     # Check if port is available and host is valid before starting
     has_error, error_msg = is_port_in_use(host, port)
     if has_error:
@@ -62,6 +80,7 @@ def cli_app(
     app.state.ollama_headers = upstream_headers
     app.state.max_tool_rounds = max_tool_rounds
     app.state.system_prompt = system_prompt
+    app.state.forward_client_headers = forward_client_headers
 
     logger.info(f"Starting MCP proxy server on {host}:{port}")
     logger.info(f"Using Ollama server: {ollama_url}")

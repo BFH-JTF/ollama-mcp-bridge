@@ -363,6 +363,11 @@ CORS_ORIGINS="http://localhost:3000,http://localhost:8080,https://app.example.co
   - Can be extended/overridden per-header with the repeatable `--upstream-header` CLI parameter (CLI takes precedence)
   - Useful for Docker deployments where headers shouldn't appear in the process list
   - Example: `UPSTREAM_HEADERS='{"Authorization": "Bearer token123", "X-API-Key": "secret"}' ollama-mcp-bridge`
+- `FORWARD_CLIENT_HEADERS`: Forward the inbound request's HTTP headers (except `host`) to Ollama on `/api/chat` (default: `true`)
+  - Enables per-request authentication: when a client calls `POST /api/chat` with an `Authorization` header, the bridge forwards it to the upstream Ollama call.
+  - Static headers from `UPSTREAM_HEADERS` / `--upstream-header` always take precedence on a case-insensitive name match, so they can override anything a client sends.
+  - Set to `false` (or pass `--no-forward-client-headers`) to disable forwarding and send only the configured static headers.
+  - The transparent proxy route (`GET|POST /{path_name:path}`) already forwards client headers; this variable only affects `/api/chat`.
 - `OLLAMA_PROXY_TIMEOUT`: Timeout for HTTP requests sent to Ollama, in **milliseconds** (default: unset)
   - When **unset**, the bridge keeps its existing behavior (some requests use library defaults; `/api/chat` is not timed out)
   - When set to a value **> 0**, the timeout is applied to Ollama-bound HTTP requests
@@ -429,6 +434,7 @@ ollama-mcp-bridge --version
 - `--port`: Port to bind the server (default: `8000`)
 - `--ollama-url`: Ollama server URL (default: `http://localhost:11434`)
 - `--upstream-header`: Header to send to the upstream server as `"Name: Value"` (repeatable; can also be set via the `UPSTREAM_HEADERS` env var)
+- `--forward-client-headers / --no-forward-client-headers`: Forward inbound request headers (except `host`) to Ollama on `/api/chat` (default: enabled; can also be set via the `FORWARD_CLIENT_HEADERS` env var)
 - `--max-tool-rounds`: Maximum tool execution rounds (default: unlimited)
 - `--reload`: Enable auto-reload during development
 - `--version`: Show version information, check for updates and exit

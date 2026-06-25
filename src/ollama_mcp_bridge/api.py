@@ -40,14 +40,19 @@ async def health():
     summary="Generate a chat completion",
     description="Transparent proxy to Ollama's /api/chat with MCP tool injection.",
 )
-async def chat(body: Dict[str, Any] = Body(..., example=CHAT_EXAMPLE)):
-    """Transparent proxy for Ollama's /api/chat, with MCP tool injection."""
+async def chat(body: Dict[str, Any] = Body(..., example=CHAT_EXAMPLE), request: Request = None):
+    """Transparent proxy for Ollama's /api/chat, with MCP tool injection.
+
+    The inbound ``request`` is passed through so the proxy service can forward
+    client headers (e.g. ``Authorization``) to Ollama when the operator has
+    enabled ``FORWARD_CLIENT_HEADERS`` / ``--forward-client-headers``.
+    """
     proxy_service = get_proxy_service()
     if not proxy_service:
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Services not initialized")
 
     try:
-        return await proxy_service.proxy_chat_with_tools(body, stream=body.get("stream", False))
+        return await proxy_service.proxy_chat_with_tools(body, stream=body.get("stream", False), request=request)
     except httpx.HTTPStatusError as e:
         logger.error(f"/api/chat failed: {e.response.text}")
         raise HTTPException(status_code=e.response.status_code, detail=e.response.text) from e

@@ -26,15 +26,22 @@ async def lifespan(fastapi_app: FastAPI):
         ollama_url = getattr(fastapi_app.state, "ollama_url", "http://localhost:11434")
         ollama_headers = getattr(fastapi_app.state, "ollama_headers", None)
         max_tool_rounds = getattr(fastapi_app.state, "max_tool_rounds", None)
+        forward_client_headers = bool(getattr(fastapi_app.state, "forward_client_headers", False))
         logger.info(
             f"Starting with config file: {config_file}, Ollama URL: {ollama_url}, Max tool rounds: {max_tool_rounds if max_tool_rounds else 'unlimited'}"
         )
+        logger.info(f"Forwarding client headers to Ollama: {'enabled' if forward_client_headers else 'disabled'}")
 
         # Get optional system prompt
         system_prompt = getattr(fastapi_app.state, "system_prompt", None)
 
         # Initialize manager and load servers
-        mcp_manager = MCPManager(ollama_url=ollama_url, system_prompt=system_prompt, ollama_headers=ollama_headers)
+        mcp_manager = MCPManager(
+            ollama_url=ollama_url,
+            system_prompt=system_prompt,
+            ollama_headers=ollama_headers,
+            forward_client_headers=forward_client_headers,
+        )
         mcp_manager.max_tool_rounds = max_tool_rounds
         await mcp_manager.load_servers(config_file)
 

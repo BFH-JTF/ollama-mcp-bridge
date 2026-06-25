@@ -34,6 +34,23 @@ class ProxyService:
         headers.update(self.ollama_headers)
         return headers
 
+    def _forwarding_enabled(self) -> bool:
+        """Whether the operator opted in to forwarding per-request client headers to Ollama."""
+        return bool(getattr(self.mcp_manager, "forward_client_headers", False))
+
+    def _upstream_headers(self, request: Optional[Request]) -> Dict[str, str]:
+        """Build the headers to send to Ollama for a given inbound request.
+
+        When forwarding is disabled, this returns the static configured headers only.
+        When forwarding is enabled, all incoming headers (except ``host``) are
+        merged with the configured static headers (configured values win on a
+        case-insensitive name match).
+        """
+        if not self._forwarding_enabled() or request is None:
+            return dict(self.ollama_headers)
+        forwarded = {k: v for k, v in request.headers.items() if k.lower() != "host"}
+        return self._get_ollama_headers(forwarded)
+
     def _maybe_prepend_system_prompt(self, messages: list) -> list:
         """If a system prompt is configured on the MCP manager, ensure it is the first message.
 
@@ -58,28 +75,32 @@ class ProxyService:
         }
 
     async def proxy_chat_with_tools(
-        self, payload: Dict[str, Any], stream: bool = False
+        self, payload: Dict[str, Any], stream: bool = False, request: Optional[Request] = None
     ) -> Union[Dict[str, Any], StreamingResponse]:
         """Handle chat requests with potential tool integration
 
         Args:
             payload: The request payload
             stream: Whether to use streaming response
+            request: The inbound FastAPI request, used to forward client headers to Ollama
+                when ``forward_client_headers`` is enabled on the MCP manager.
 
         Returns:
             Either a dictionary response or a StreamingResponse
         """
-        if not await check_ollama_health_async(self.mcp_manager.ollama_url, headers=self.ollama_headers):
+        if not await check_ollama_health_async(self.mcp_manager.ollama_url, headers=self._upstream_headers(request)):
             raise httpx.RequestError("Ollama server not accessible", request=None)
 
         try:
             if stream:
                 return StreamingResponse(
-                    self._proxy_with_tools_streaming(endpoint="/api/chat", payload=payload),
+                    self._proxy_with_tools_streaming(endpoint="/api/chat", payload=payload, request=request),
                     media_type="application/json",
                 )
             else:
-                return await self._proxy_with_tools_non_streaming(endpoint="/api/chat", payload=payload)
+                return await self._proxy_with_tools_non_streaming(
+                    endpoint="/api/chat", payload=payload, request=request
+                )
         except httpx.HTTPStatusError as e:
             logger.error(f"Chat proxy failed: {e.response.text}")
             raise
@@ -90,14 +111,18 @@ class ProxyService:
             logger.error(f"Chat proxy failed: {e}")
             raise
 
-    async def _make_final_llm_call(self, endpoint: str, payload: Dict[str, Any], messages: list) -> Dict[str, Any]:
+    async def _make_final_llm_call(
+        self, endpoint: str, payload: Dict[str, Any], messages: list, request: Optional[Request] = None
+    ) -> Dict[str, Any]:
         """Make a final LLM call without tools to get final answer after tool execution"""
         final_payload = dict(payload)
         final_payload["stream"] = False  # Explicitly disable streaming to get single JSON response
         final_payload["messages"] = messages
         final_payload["tools"] = None  # Don't allow more tool calls
         resp = await self.http_client.post(
-            f"{self.mcp_manager.ollama_url}{endpoint}", json=final_payload, headers=self.ollama_headers
+            f"{self.mcp_manager.ollama_url}{endpoint}",
+            json=final_payload,
+            headers=self._upstream_headers(request),
         )
         resp.raise_for_status()
         return resp.json()
@@ -115,7 +140,9 @@ class ProxyService:
             buffer_chunk = json.dumps(json_obj).encode() + b"\n"
             yield buffer_chunk
 
-    async def _proxy_with_tools_non_streaming(self, endpoint: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    async def _proxy_with_tools_non_streaming(
+        self, endpoint: str, payload: Dict[str, Any], request: Optional[Request] = None
+    ) -> Dict[str, Any]:
         """Handle non-streaming chat requests with tools"""
         payload = dict(payload)
         payload["stream"] = False  # Explicitly disable streaming to get single JSON response
@@ -133,7 +160,9 @@ class ProxyService:
             current_payload = dict(payload)
             current_payload["messages"] = messages
             resp = await self.http_client.post(
-                f"{self.mcp_manager.ollama_url}{endpoint}", json=current_payload, headers=self.ollama_headers
+                f"{self.mcp_manager.ollama_url}{endpoint}",
+                json=current_payload,
+                headers=self._upstream_headers(request),
             )
             resp.raise_for_status()
             result = resp.json()
@@ -157,11 +186,13 @@ class ProxyService:
                 logger.warning(
                     f"Reached maximum tool execution rounds ({max_rounds}), making final LLM call with tool results"
                 )
-                return await self._make_final_llm_call(endpoint, payload, messages)
+                return await self._make_final_llm_call(endpoint, payload, messages, request)
 
             # Continue loop to get next response
 
-    async def _proxy_with_tools_streaming(self, endpoint: str, payload: Dict[str, Any]) -> AsyncGenerator[bytes, None]:
+    async def _proxy_with_tools_streaming(
+        self, endpoint: str, payload: Dict[str, Any], request: Optional[Request] = None
+    ) -> AsyncGenerator[bytes, None]:
         """Handle streaming chat requests with tools"""
 
         payload = dict(payload)
@@ -175,7 +206,7 @@ class ProxyService:
                     "POST",
                     f"{self.mcp_manager.ollama_url}{endpoint}",
                     json=payload_to_send,
-                    headers=self.ollama_headers,
+                    headers=self._upstream_headers(request),
                 ) as resp:
                     async for chunk in resp.aiter_bytes():
                         yield chunk
